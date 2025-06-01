@@ -1,52 +1,187 @@
 package com.phoneremote.server;
 
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.media.projection.MediaProjectionManager;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.TextView;
+import android.widget.Toast;
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.util.Enumeration;
 
 public class MainActivity extends AppCompatActivity {
+    private static final int REQUEST_CODE_SCREEN_CAPTURE = 101;
+    
     private TextView ipAddressTextView;
     private Button startServerButton;
     private Button stopServerButton;
+    private Button screenCaptureButton;
+    private CheckBox enableAuthCheckbox;
+    private EditText usernameField;
+    private EditText passwordField;
+    private CheckBox enableFileTransferCheckbox;
+    
+    private boolean isServerRunning = false;
+    private boolean isScreenCaptureRunning = false;
+    
+    private SharedPreferences prefs;
+    private static final String PREF_NAME = "PhoneRemotePrefs";
+    private static final String PREF_USERNAME = "username";
+    private static final String PREF_PASSWORD = "password";
+    private static final String PREF_AUTH_ENABLED = "auth_enabled";
+    private static final String PREF_FILE_TRANSFER_ENABLED = "file_transfer_enabled";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        
+        // Initialize SharedPreferences
+        prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
 
+        // Initialize UI components
         ipAddressTextView = findViewById(R.id.ip_address);
         startServerButton = findViewById(R.id.start_server);
         stopServerButton = findViewById(R.id.stop_server);
+        screenCaptureButton = findViewById(R.id.screen_capture_button);
+        enableAuthCheckbox = findViewById(R.id.enable_auth_checkbox);
+        usernameField = findViewById(R.id.username_field);
+        passwordField = findViewById(R.id.password_field);
+        enableFileTransferCheckbox = findViewById(R.id.enable_file_transfer_checkbox);
+        
+        // Load saved preferences
+        loadPreferences();
 
         startServerButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                startService(new Intent(MainActivity.this, RemoteServerService.class));
-                updateButtons(true);
+                // Save authentication settings before starting server
+                savePreferences();
+                
+                // Start the server service with the saved settings
+                Intent serviceIntent = new Intent(MainActivity.this, RemoteServerService.class);
+                serviceIntent.putExtra("enableAuth", enableAuthCheckbox.isChecked());
+                serviceIntent.putExtra("username", usernameField.getText().toString());
+                serviceIntent.putExtra("password", passwordField.getText().toString());
+                serviceIntent.putExtra("enableFileTransfer", enableFileTransferCheckbox.isChecked());
+                
+                startService(serviceIntent);
+                isServerRunning = true;
+                updateButtons();
             }
         });
 
         stopServerButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                // Stop both services
                 stopService(new Intent(MainActivity.this, RemoteServerService.class));
-                updateButtons(false);
+                stopService(new Intent(MainActivity.this, ScreenCaptureService.class));
+                isServerRunning = false;
+                isScreenCaptureRunning = false;
+                updateButtons();
             }
+        });
+        
+        screenCaptureButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!isScreenCaptureRunning) {
+                    startScreenCapture();
+                } else {
+                    stopScreenCapture();
+                }
+            }
+        });
+        
+        enableAuthCheckbox.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            usernameField.setEnabled(isChecked);
+            passwordField.setEnabled(isChecked);
         });
 
         // Display the device's IP address
         displayIpAddress();
     }
+    
+    private void loadPreferences() {
+        enableAuthCheckbox.setChecked(prefs.getBoolean(PREF_AUTH_ENABLED, false));
+        usernameField.setText(prefs.getString(PREF_USERNAME, "admin"));
+        passwordField.setText(prefs.getString(PREF_PASSWORD, "password"));
+        enableFileTransferCheckbox.setChecked(prefs.getBoolean(PREF_FILE_TRANSFER_ENABLED, false));
+        
+        usernameField.setEnabled(enableAuthCheckbox.isChecked());
+        passwordField.setEnabled(enableAuthCheckbox.isChecked());
+    }
+    
+    private void savePreferences() {
+        SharedPreferences.Editor editor = prefs.edit();
+        editor.putBoolean(PREF_AUTH_ENABLED, enableAuthCheckbox.isChecked());
+        editor.putString(PREF_USERNAME, usernameField.getText().toString());
+        editor.putString(PREF_PASSWORD, passwordField.getText().toString());
+        editor.putBoolean(PREF_FILE_TRANSFER_ENABLED, enableFileTransferCheckbox.isChecked());
+        editor.apply();
+    }
 
-    private void updateButtons(boolean serverRunning) {
-        startServerButton.setEnabled(!serverRunning);
-        stopServerButton.setEnabled(serverRunning);
+    private void updateButtons() {
+        startServerButton.setEnabled(!isServerRunning);
+        stopServerButton.setEnabled(isServerRunning);
+        screenCaptureButton.setEnabled(isServerRunning);
+        
+        if (isScreenCaptureRunning) {
+            screenCaptureButton.setText("Stop Screen Sharing");
+        } else {
+            screenCaptureButton.setText("Start Screen Sharing");
+        }
+        
+        // Disable auth settings when server is running
+        enableAuthCheckbox.setEnabled(!isServerRunning);
+        usernameField.setEnabled(!isServerRunning && enableAuthCheckbox.isChecked());
+        passwordField.setEnabled(!isServerRunning && enableAuthCheckbox.isChecked());
+        enableFileTransferCheckbox.setEnabled(!isServerRunning);
+    }
+    
+    private void startScreenCapture() {
+        MediaProjectionManager projectionManager = 
+                (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        
+        Intent captureIntent = projectionManager.createScreenCaptureIntent();
+        startActivityForResult(captureIntent, REQUEST_CODE_SCREEN_CAPTURE);
+    }
+    
+    private void stopScreenCapture() {
+        stopService(new Intent(MainActivity.this, ScreenCaptureService.class));
+        isScreenCaptureRunning = false;
+        updateButtons();
+        Toast.makeText(this, "Screen sharing stopped", Toast.LENGTH_SHORT).show();
+    }
+    
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        
+        if (requestCode == REQUEST_CODE_SCREEN_CAPTURE) {
+            if (resultCode == RESULT_OK && data != null) {
+                // Start the screen capture service
+                Intent intent = new Intent(this, ScreenCaptureService.class);
+                intent.putExtra("resultCode", resultCode);
+                intent.putExtra("data", data);
+                startService(intent);
+                
+                isScreenCaptureRunning = true;
+                updateButtons();
+                Toast.makeText(this, "Screen sharing started", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "Screen capture permission denied", Toast.LENGTH_SHORT).show();
+            }
+        }
     }
 
     private void displayIpAddress() {
@@ -64,5 +199,12 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             ipAddressTextView.setText("Unable to get IP address");
         }
+    }
+    
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        // Save preferences when activity is destroyed
+        savePreferences();
     }
 }
