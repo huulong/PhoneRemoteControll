@@ -1,18 +1,24 @@
 package com.phoneremote.server;
 
+import android.Manifest;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.media.projection.MediaProjectionManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.util.Base64;
@@ -22,13 +28,21 @@ import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.security.crypto.EncryptedSharedPreferences;
+import androidx.security.crypto.MasterKey;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import javax.crypto.Cipher;
@@ -37,6 +51,17 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends AppCompatActivity {
+    private static final int PERMISSION_REQUEST_CODE = 1234;
+    private static final String[] REQUIRED_PERMISSIONS = {
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE
+    };
+    
+    private ActivityResultLauncher<String[]> permissionLauncher;
+    private ActivityResultLauncher<Intent> notificationPermissionLauncher;
+    private ActivityResultLauncher<Intent> manageStorageLauncher;
     private static final String KEYSTORE_ALIAS = "PhoneRemoteKey";
     private static final int GCM_IV_LENGTH = 12;
     private static final int GCM_TAG_LENGTH = 128;
@@ -67,6 +92,8 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        setupPermissionLaunchers();
+        checkAndRequestPermissions();
         setupNetworkCallback();
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
@@ -193,6 +220,97 @@ public class MainActivity extends AppCompatActivity {
         enableFileTransferCheckbox.setEnabled(!isServerRunning);
     }
     
+    private void setupPermissionLaunchers() {
+        permissionLauncher = registerForActivityResult(
+                new ActivityResultContracts.RequestMultiplePermissions(),
+                permissions -> {
+                    boolean allGranted = true;
+                    for (Boolean granted : permissions.values()) {
+                        if (!granted) {
+                            allGranted = false;
+                            break;
+                        }
+                    }
+                    if (allGranted) {
+                        checkNotificationPermission();
+                    } else {
+                        Toast.makeText(this, "All permissions are required", Toast.LENGTH_LONG).show();
+                    }
+                });
+
+        notificationPermissionLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> checkManageStoragePermission());
+
+        manageStorageLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        if (Environment.isExternalStorageManager()) {
+                            // All permissions granted, continue setup
+                            continueSetup();
+                        } else {
+                            Toast.makeText(this, "Storage permission required", Toast.LENGTH_LONG).show();
+                        }
+                    }
+                });
+    }
+
+    private void checkAndRequestPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            List<String> permissionsToRequest = new ArrayList<>();
+            
+            for (String permission : REQUIRED_PERMISSIONS) {
+                if (ContextCompat.checkSelfPermission(this, permission) 
+                        != PackageManager.PERMISSION_GRANTED) {
+                    permissionsToRequest.add(permission);
+                }
+            }
+            
+            if (!permissionsToRequest.isEmpty()) {
+                permissionLauncher.launch(permissionsToRequest.toArray(new String[0]));
+            } else {
+                checkNotificationPermission();
+            }
+        } else {
+            continueSetup();
+        }
+    }
+
+    private void checkNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) 
+                    != PackageManager.PERMISSION_GRANTED) {
+                Intent intent = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                notificationPermissionLauncher.launch(intent);
+            } else {
+                checkManageStoragePermission();
+            }
+        } else {
+            checkManageStoragePermission();
+        }
+    }
+
+    private void checkManageStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                        .setData(Uri.parse("package:" + getPackageName()));
+                manageStorageLauncher.launch(intent);
+            } else {
+                continueSetup();
+            }
+        } else {
+            continueSetup();
+        }
+    }
+
+    private void continueSetup() {
+        // Initialize your app here after all permissions are granted
+        Toast.makeText(this, "All permissions granted", Toast.LENGTH_SHORT).show();
+    }
+
     private void startScreenCapture() {
         MediaProjectionManager projectionManager = 
                 (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
