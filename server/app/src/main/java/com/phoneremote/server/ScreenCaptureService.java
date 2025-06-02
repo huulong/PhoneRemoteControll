@@ -17,6 +17,7 @@ import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.WindowManager;
@@ -24,11 +25,33 @@ import androidx.core.app.NotificationCompat;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ScreenCaptureService extends Service {
+    private static final int MAX_FRAME_RATE = 30;
+    private static final int MIN_FRAME_RATE = 5;
+    private static final int INITIAL_FRAME_RATE = 15;
+    private static final int QUALITY_HIGH = 100;
+    private static final int QUALITY_LOW = 60;
+    
+    private final AtomicInteger currentFrameRate = new AtomicInteger(INITIAL_FRAME_RATE);
+    private final AtomicInteger currentQuality = new AtomicInteger(QUALITY_HIGH);
+    private final ExecutorService imageProcessingExecutor = Executors.newFixedThreadPool(2);
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    
+    private byte[] previousFrame;
+    private long lastFrameTime;
+    private int droppedFrames;
+    private static final int MAX_DROPPED_FRAMES = 30;
+    
+    private Runtime runtime;
+    private static final double MEMORY_THRESHOLD = 0.8; // 80% memory usage threshold
     private static final String TAG = "ScreenCaptureService";
     private static final int NOTIFICATION_ID = 2;
     private static final String CHANNEL_ID = "ScreenCaptureChannel";
@@ -83,6 +106,9 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onDestroy() {
         stopCapture();
+        imageProcessingExecutor.shutdown();
+        mainHandler.removeCallbacksAndMessages(null);
+        previousFrame = null;
         super.onDestroy();
         instance = null;
     }
@@ -93,6 +119,8 @@ public class ScreenCaptureService extends Service {
     }
     
     private void startForeground() {
+
+        Notification 0.3s
         NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -180,15 +208,56 @@ public class ScreenCaptureService extends Service {
     }
     
     private void startCaptureTimer() {
+        runtime = Runtime.getRuntime();
         timer = new Timer();
         timer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
                 if (imageReader != null && isCapturing.get()) {
+                    long now = System.currentTimeMillis();
+                    if (now - lastFrameTime < 1000 / currentFrameRate.get()) {
+                        return; // Skip frame if too soon
+                    }
+                    
+                    // Check memory usage
+                    double memoryUsage = (runtime.totalMemory() - runtime.freeMemory()) / 
+                            (double) runtime.maxMemory();
+                    
+                    if (memoryUsage > MEMORY_THRESHOLD) {
+                        // Reduce quality and frame rate under memory pressure
+                        adjustPerformance(true);
+                    } else if (droppedFrames < MAX_DROPPED_FRAMES / 2) {
+                        // Increase quality and frame rate if performance is good
+                        adjustPerformance(false);
+                    }
+                    
                     captureScreen();
+                    lastFrameTime = now;
                 }
             }
-        }, 0, 200);  // Capture every 200ms (5fps) - adjust as needed for performance
+        }, 0, 1000 / INITIAL_FRAME_RATE);
+    }
+    
+    private void adjustPerformance(boolean reduce) {
+        if (reduce) {
+            int newFrameRate = Math.max(MIN_FRAME_RATE, currentFrameRate.get() - 5);
+            int newQuality = Math.max(QUALITY_LOW, currentQuality.get() - 10);
+            currentFrameRate.set(newFrameRate);
+            currentQuality.set(newQuality);
+            droppedFrames = 0;
+        } else {
+            int newFrameRate = Math.min(MAX_FRAME_RATE, currentFrameRate.get() + 1);
+            int newQuality = Math.min(QUALITY_HIGH, currentQuality.get() + 5);
+            currentFrameRate.set(newFrameRate);
+            currentQuality.set(newQuality);
+        }
+        
+        // Update timer interval
+        if (timer != null) {
+            timer.cancel();
+            timer = null;
+            startCaptureTimer();
+        }
     }
     
     private void captureScreen() {
@@ -197,6 +266,7 @@ public class ScreenCaptureService extends Service {
         }
         
         Image image = null;
+        droppedFrames++;
         try {
             image = imageReader.acquireLatestImage();
             if (image != null) {
@@ -216,40 +286,5 @@ public class ScreenCaptureService extends Service {
                 image.close();
             }
         }
-    }
-    
-    private byte[] imageToByte(Image image) {
-        // Try to compress the image to JPEG format
-        if (image == null) return null;
-        
-        Image.Plane[] planes = image.getPlanes();
-        ByteBuffer buffer = planes[0].getBuffer();
-        
-        // Create bitmap from buffer
-        int pixelStride = planes[0].getPixelStride();
-        int rowStride = planes[0].getRowStride();
-        int rowPadding = rowStride - pixelStride * image.getWidth();
-        
-        Bitmap bitmap = Bitmap.createBitmap(
-                image.getWidth() + rowPadding / pixelStride,
-                image.getHeight(),
-                Bitmap.Config.ARGB_8888
-        );
-        bitmap.copyPixelsFromBuffer(buffer);
-        
-        // Crop bitmap to correct dimensions
-        Bitmap croppedBitmap = Bitmap.createBitmap(
-                bitmap, 0, 0, image.getWidth(), image.getHeight()
-        );
-        
-        // Compress to JPEG with reduced quality
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 50, baos);
-        
-        // Clean up
-        bitmap.recycle();
-        croppedBitmap.recycle();
-        
-        return baos.toByteArray();
     }
 }

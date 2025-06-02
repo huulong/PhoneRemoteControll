@@ -1,23 +1,49 @@
 package com.phoneremote.server;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.media.projection.MediaProjectionManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.util.Base64;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.util.Enumeration;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends AppCompatActivity {
+    private static final String KEYSTORE_ALIAS = "PhoneRemoteKey";
+    private static final int GCM_IV_LENGTH = 12;
+    private static final int GCM_TAG_LENGTH = 128;
+    private final Executor backgroundExecutor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private String cachedIpAddress = null;
     private static final int REQUEST_CODE_SCREEN_CAPTURE = 101;
     
     private TextView ipAddressTextView;
@@ -41,6 +67,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        setupNetworkCallback();
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         
@@ -112,22 +139,40 @@ public class MainActivity extends AppCompatActivity {
     }
     
     private void loadPreferences() {
-        enableAuthCheckbox.setChecked(prefs.getBoolean(PREF_AUTH_ENABLED, false));
-        usernameField.setText(prefs.getString(PREF_USERNAME, "admin"));
-        passwordField.setText(prefs.getString(PREF_PASSWORD, "password"));
-        enableFileTransferCheckbox.setChecked(prefs.getBoolean(PREF_FILE_TRANSFER_ENABLED, false));
-        
-        usernameField.setEnabled(enableAuthCheckbox.isChecked());
-        passwordField.setEnabled(enableAuthCheckbox.isChecked());
+        try {
+            enableAuthCheckbox.setChecked(prefs.getBoolean(PREF_AUTH_ENABLED, false));
+            usernameField.setText(prefs.getString(PREF_USERNAME, "admin"));
+            String encryptedPassword = prefs.getString(PREF_PASSWORD, null);
+            if (encryptedPassword != null) {
+                passwordField.setText(decryptPassword(encryptedPassword));
+            } else {
+                passwordField.setText("");
+            }
+            enableFileTransferCheckbox.setChecked(prefs.getBoolean(PREF_FILE_TRANSFER_ENABLED, false));
+            
+            usernameField.setEnabled(enableAuthCheckbox.isChecked());
+            passwordField.setEnabled(enableAuthCheckbox.isChecked());
+        } catch (Exception e) {
+            Toast.makeText(this, "Failed to load settings", Toast.LENGTH_SHORT).show();
+        }
     }
     
     private void savePreferences() {
-        SharedPreferences.Editor editor = prefs.edit();
-        editor.putBoolean(PREF_AUTH_ENABLED, enableAuthCheckbox.isChecked());
-        editor.putString(PREF_USERNAME, usernameField.getText().toString());
-        editor.putString(PREF_PASSWORD, passwordField.getText().toString());
-        editor.putBoolean(PREF_FILE_TRANSFER_ENABLED, enableFileTransferCheckbox.isChecked());
-        editor.apply();
+        if (enableAuthCheckbox.isChecked() && !isPasswordValid(passwordField.getText().toString())) {
+            Toast.makeText(this, "Password must be at least 8 characters with numbers and letters", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        try {
+            SharedPreferences.Editor editor = prefs.edit();
+            editor.putBoolean(PREF_AUTH_ENABLED, enableAuthCheckbox.isChecked());
+            editor.putString(PREF_USERNAME, usernameField.getText().toString());
+            editor.putString(PREF_PASSWORD, encryptPassword(passwordField.getText().toString()));
+            editor.putBoolean(PREF_FILE_TRANSFER_ENABLED, enableFileTransferCheckbox.isChecked());
+            editor.apply();
+        } catch (Exception e) {
+            Toast.makeText(this, "Failed to save settings", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void updateButtons() {
@@ -185,20 +230,30 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void displayIpAddress() {
-        try {
-            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
-                NetworkInterface intf = en.nextElement();
-                for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
-                    InetAddress inetAddress = enumIpAddr.nextElement();
-                    if (!inetAddress.isLoopbackAddress() && !inetAddress.getHostAddress().contains(":")) {
-                        ipAddressTextView.setText("Device IP: " + inetAddress.getHostAddress() + ":8080");
-                        return;
+        if (cachedIpAddress != null) {
+            ipAddressTextView.setText("Device IP: " + cachedIpAddress + ":8080");
+            return;
+        }
+
+        backgroundExecutor.execute(() -> {
+            try {
+                for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
+                    NetworkInterface intf = en.nextElement();
+                    for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
+                        InetAddress inetAddress = enumIpAddr.nextElement();
+                        if (!inetAddress.isLoopbackAddress() && !inetAddress.getHostAddress().contains(":")) {
+                            cachedIpAddress = inetAddress.getHostAddress();
+                            mainHandler.post(() -> 
+                                ipAddressTextView.setText("Device IP: " + cachedIpAddress + ":8080"));
+                            return;
+                        }
                     }
                 }
+                mainHandler.post(() -> ipAddressTextView.setText("Unable to get IP address"));
+            } catch (Exception e) {
+                mainHandler.post(() -> ipAddressTextView.setText("Unable to get IP address"));
             }
-        } catch (Exception e) {
-            ipAddressTextView.setText("Unable to get IP address");
-        }
+        });
     }
     
     @Override
